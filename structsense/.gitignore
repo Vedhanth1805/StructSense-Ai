@@ -16,9 +16,17 @@ venv/
 # Model outputs
 outputs/models/
 outputs/reports/
+**/outputs/models/
+**/outputs/reports/
 
 # IDE
 .vscode/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Django private data / local DB
+structsense/backend/db.sqlite3
+structsense/backend/private_uploads/
+structsense/backend/private_reports/
+structsense/backend/staticfiles/

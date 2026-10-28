@@ -5,7 +5,7 @@ Two components:
 
 1. StructuralRiskScorer
    - Accepts a raw 18-dim parameter dict OR normalised state vector
-   - Weighted-sum risk score (0–1) across 6 critical parameters
+   - Aggregate risk blends the six-factor score and four element risks
    - Per-element breakdown: {foundation, columns, beams, slab}
    - Red-zone flagging for elements with risk > 0.70
 
@@ -18,7 +18,11 @@ Two components:
 from __future__ import annotations
 
 import math
+import os
+import tempfile
+import threading
 from typing import Dict, List, Optional, Tuple, Union
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -37,7 +41,16 @@ class StructuralRiskScorer:
     """
     Rule-based structural risk scorer operating on the 18-dimensional state.
 
-    Weighted-sum overall risk (0–1):
+    The aggregate score blends two independently visible summaries:
+      * 50% existing six-factor weighted risk
+      * 50% arithmetic mean of foundation, column, beam, and slab risks
+
+    This equal blend gives the established environmental/foundation factors
+    and the four structural-element groups equal influence. Each element group
+    has equal weight in its mean. It is a screening formula, not a calibrated
+    engineering design rule; prior stored results remain historical snapshots.
+
+    Existing six-factor weighted risk (0–1):
         seismic_zone                  0.25
         soil_bearing_capacity_kn_m2   0.20  (inverted: low SBC = high risk)
         column_reinforcement_ratio     0.20  (inverted: low rho = high risk)
@@ -63,6 +76,11 @@ class StructuralRiskScorer:
         ("building_age_years",           0.10, False),   # old = bad
         ("shear_wall_present",           0.10, True),    # absent = bad
     ]
+
+    LEGACY_RISK_WEIGHT = 0.50
+    ELEMENT_MEAN_WEIGHT = 0.50
+    ELEMENT_KEYS = ("foundation", "columns", "beams", "slab")
+    FORMULA_VERSION = "six-factor-plus-element-mean-v1"
 
     RED_ZONE_THRESHOLD = 0.70
 
@@ -111,12 +129,47 @@ class StructuralRiskScorer:
         Returns:
             risk ∈ [0.0, 1.0]  — higher = more dangerous
         """
+        legacy = self.legacy_score(state_vec=state_vec, raw_params=raw_params)
+        elements = self.element_breakdown(state_vec=state_vec, raw_params=raw_params)
+        element_mean = sum(elements[key] for key in self.ELEMENT_KEYS) / len(self.ELEMENT_KEYS)
+        return float(np.clip(
+            self.LEGACY_RISK_WEIGHT * legacy + self.ELEMENT_MEAN_WEIGHT * element_mean,
+            0.0, 1.0,
+        ))
+
+    def legacy_score(
+        self,
+        state_vec: Optional[np.ndarray] = None,
+        raw_params: Optional[Dict] = None,
+    ) -> float:
+        """Return the original normalized six-factor weighted component."""
         total = 0.0
         for key, weight, invert in self.WEIGHTED_PARAMS:
             norm_val = self._get_norm(key, state_vec, raw_params)
             contribution = (1.0 - norm_val) if invert else norm_val
             total += weight * contribution
         return float(np.clip(total, 0.0, 1.0))
+
+    def aggregate_components(
+        self,
+        state_vec: Optional[np.ndarray] = None,
+        raw_params: Optional[Dict] = None,
+    ) -> Dict[str, float]:
+        """Return transparent inputs to the versioned aggregate formula."""
+        elements = self.element_breakdown(state_vec=state_vec, raw_params=raw_params)
+        legacy = self.legacy_score(state_vec=state_vec, raw_params=raw_params)
+        element_mean = sum(elements[key] for key in self.ELEMENT_KEYS) / len(self.ELEMENT_KEYS)
+        aggregate = self.LEGACY_RISK_WEIGHT * legacy + self.ELEMENT_MEAN_WEIGHT * element_mean
+        return {
+            "formula_version": self.FORMULA_VERSION,
+            "formula": "0.50 * legacy_six_factor_risk + 0.50 * mean(foundation, columns, beams, slab)",
+            "legacy_six_factor_weight": self.LEGACY_RISK_WEIGHT,
+            "element_mean_weight": self.ELEMENT_MEAN_WEIGHT,
+            "legacy_six_factor_risk": round(legacy, 6),
+            "element_risks": elements,
+            "mean_element_risk": round(element_mean, 6),
+            "aggregate_risk": round(float(np.clip(aggregate, 0.0, 1.0)), 6),
+        }
 
     # ------------------------------------------------------------------ #
     #  Weighted-component breakdown                                        #
@@ -294,9 +347,14 @@ class NeuralDSW(nn.Module):
         w → 0: model trusts the structure is safe → failure penalty is discounted
         w → 1: model sees high risk → failure penalty is amplified
 
-    Training:
-        Supervised on (state, true_risk_label) pairs; uses BCELoss.
-        Alternatively trained end-to-end with RL rewards via policy gradient.
+    Current training path:
+        Supervised on synthetic states labelled from
+        StructuralRiskScorer.score() >= 0.55; uses binary cross-entropy.
+        This is independent of PPO rollouts and does not use episode-return
+        gradients. The output is a learned approximation of the risk-scoring
+        formula's threshold classification, not an RL-derived contextual
+        safety signal. When supplied to PPOStructuralAgent, its per-state
+        output scales the PPO environment failure penalty around a neutral 0.5.
     """
 
     def __init__(
@@ -374,7 +432,8 @@ class NeuralDSW(nn.Module):
         passed: bool = True,
     ) -> Dict[str, float]:
         """
-        Compute adaptive reward for an RL transition.
+        Compute a standalone adaptive-reward utility value. This helper is not
+        used by PPOStructuralAgent, whose reward comes from BuildingStressEnv.
 
             R = structural_efficiency − (w × failure_penalty)
 
@@ -532,7 +591,12 @@ class NeuralDSW(nn.Module):
         torch.save(self.state_dict(), path)
 
     def load(self, path: str, map_location: str = "cpu") -> None:
-        self.load_state_dict(torch.load(path, map_location=map_location))
+        try:
+            payload = torch.load(path, map_location=map_location, weights_only=True)
+        except TypeError:  # Compatibility with older supported PyTorch releases.
+            payload = torch.load(path, map_location=map_location)
+        state = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+        self.load_state_dict(state)
         self.eval()
 
 
@@ -546,10 +610,86 @@ def make_pretrained_dsw(
     verbose: bool = False,
 ) -> NeuralDSW:
     """
-    Instantiate and pre-train a NeuralDSW on synthetic risk data.
-    Ready to use as a drop-in safety-weight provider.
+    Instantiate and supervised-fit NeuralDSW on synthetic risk labels.
     """
     dsw    = NeuralDSW()
     states, labels = NeuralDSW.generate_training_data(n_samples=n_samples)
     dsw.fit(states, labels, epochs=epochs, verbose=verbose)
     return dsw
+
+
+_DSW_MODEL_CACHE: Dict[str, NeuralDSW] = {}
+_DSW_MODEL_LOCK = threading.Lock()
+
+
+def load_or_train_dsw(
+    checkpoint_path: Optional[Union[str, Path]] = None,
+    n_samples: int = 2000,
+    epochs: int = 50,
+    seed: int = 42,
+) -> NeuralDSW:
+    """Load the shared checkpoint or train/save it once, then reuse in-process.
+
+    The checkpoint is tied to the aggregate-risk formula version because its
+    synthetic labels are generated by StructuralRiskScorer.score().
+    """
+    configured = checkpoint_path or os.environ.get("STRUCTSENSE_DSW_CHECKPOINT", "") or "outputs/models/neural_dsw.pt"
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    path = path.resolve()
+    key = str(path)
+    with _DSW_MODEL_LOCK:
+        cached = _DSW_MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        metadata = {"status": "loaded", "checkpoint": key, "seed": seed,
+                    "n_samples": n_samples, "epochs": epochs,
+                    "risk_formula_version": StructuralRiskScorer.FORMULA_VERSION}
+        model = NeuralDSW()
+        if path.is_file():
+            try:
+                try:
+                    payload = torch.load(path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    payload = torch.load(path, map_location="cpu")
+                if not isinstance(payload, dict) or payload.get("risk_formula_version") != StructuralRiskScorer.FORMULA_VERSION:
+                    raise ValueError("DSW checkpoint was trained for a different risk formula")
+                state = payload.get("state_dict")
+                if not isinstance(state, dict):
+                    raise ValueError("DSW checkpoint has no state_dict")
+                model.load_state_dict(state)
+                metadata.update(payload.get("training_metadata", {}))
+                metadata["status"] = "loaded_from_checkpoint"
+            except Exception:
+                # A stale/corrupt incompatible checkpoint is replaced by a fresh
+                # version-matched model; it is never silently used.
+                model = None
+        else:
+            model = None
+
+        if model is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed)
+                model = NeuralDSW()
+                states, labels = NeuralDSW.generate_training_data(n_samples=n_samples, seed=seed)
+                losses = model.fit(states, labels, epochs=epochs)
+            metadata.update({"status": "trained_and_saved", "trained": True,
+                             "final_training_loss": round(losses[-1], 6) if losses else None})
+            fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+            os.close(fd)
+            try:
+                torch.save({"state_dict": model.state_dict(),
+                            "risk_formula_version": StructuralRiskScorer.FORMULA_VERSION,
+                            "training_metadata": metadata}, temp_name)
+                os.replace(temp_name, path)
+            finally:
+                if os.path.exists(temp_name):
+                    os.unlink(temp_name)
+
+        model.training_metadata = metadata
+        model.eval()
+        _DSW_MODEL_CACHE[key] = model
+        return model

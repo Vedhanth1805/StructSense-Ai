@@ -22,11 +22,14 @@ class _RiskTrajectoryCallback(BaseCallback):
         self.episode_rewards: List[float] = []
         self.scenario_pass_counts: Dict[str, int] = {n: 0 for n in ACTION_NAMES.values()}
         self.scenario_fail_counts: Dict[str, int] = {n: 0 for n in ACTION_NAMES.values()}
+        self.dsw_weights: List[float] = []
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
             risk = info.get("risk_score", info.get("current_risk", 0))
             self.episode_risks.append(risk)
+            if info.get("dsw_safety_weight") is not None:
+                self.dsw_weights.append(float(info["dsw_safety_weight"]))
             name = info.get("action_name", "")
             if info.get("passed") is True and name in self.scenario_pass_counts:
                 self.scenario_pass_counts[name] += 1
@@ -40,13 +43,15 @@ class PPOStructuralAgent:
 
     MODEL_DIR = os.path.join("outputs", "models")
 
-    def __init__(self, blueprint_params: Dict[str, Any]):
+    def __init__(self, blueprint_params: Dict[str, Any], dsw_model=None):
         self.blueprint_params   = blueprint_params
+        self.dsw_model          = dsw_model
         self.model: Optional[PPO] = None
         self._train_risks:    List[float] = []
         self._eval_trajectory: List[float] = []
         self._training_metrics: Dict[str, Any] = {}
         self._callback: Optional[_RiskTrajectoryCallback] = None
+        self._dsw_weights: List[float] = []
         os.makedirs(self.MODEL_DIR, exist_ok=True)
 
     # ------------------------------------------------------------------ #
@@ -54,7 +59,7 @@ class PPOStructuralAgent:
     # ------------------------------------------------------------------ #
     def train(self, timesteps: int = 5000) -> Dict[str, Any]:
         def _make_env():
-            return BuildingStressEnv(self.blueprint_params, max_steps=20)
+            return BuildingStressEnv(self.blueprint_params, max_steps=20, dsw_model=self.dsw_model)
 
         vec_env        = make_vec_env(_make_env, n_envs=1)
         self._callback = _RiskTrajectoryCallback()
@@ -79,6 +84,7 @@ class PPOStructuralAgent:
             progress_bar=False,
         )
         self._train_risks = self._callback.episode_risks
+        self._dsw_weights = self._callback.dsw_weights
 
         model_path = os.path.join(self.MODEL_DIR, "ppo_structural")
         self.model.save(model_path)
@@ -93,6 +99,9 @@ class PPOStructuralAgent:
             "risk_samples":        len(risks),
             "scenario_pass_counts":self._callback.scenario_pass_counts,
             "scenario_fail_counts":self._callback.scenario_fail_counts,
+            "dsw_in_reward": self.dsw_model is not None,
+            "dsw_weight_samples": len(self._dsw_weights),
+            "mean_dsw_safety_weight": round(float(np.mean(self._dsw_weights)), 6) if self._dsw_weights else None,
         }
         return self._training_metrics
 
@@ -103,7 +112,7 @@ class PPOStructuralAgent:
         if self.model is None:
             raise RuntimeError("Call train() first.")
 
-        env = BuildingStressEnv(self.blueprint_params, max_steps=20)
+        env = BuildingStressEnv(self.blueprint_params, max_steps=20, dsw_model=self.dsw_model)
         episode_rewards:  List[float]       = []
         episode_risks:    List[List[float]] = []
         action_counts:    Dict[int, int]    = {i: 0 for i in range(5)}
@@ -166,7 +175,7 @@ class PPOStructuralAgent:
         if self.model is None:
             raise RuntimeError("Call train() first.")
 
-        env = BuildingStressEnv(self.blueprint_params, max_steps=20)
+        env = BuildingStressEnv(self.blueprint_params, max_steps=20, dsw_model=self.dsw_model)
         obs, _ = env.reset(seed=0)
         done = False
         steps: List[Dict] = []

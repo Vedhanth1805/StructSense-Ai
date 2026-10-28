@@ -1,4 +1,4 @@
-"""StructSense AI — Streamlit Dashboard  (Google Gemini 2.0 Flash · PPO RL)"""
+"""StructSense AI — Streamlit Dashboard (optional Groq LLaMA · PPO research demo)"""
 import json, os, sys, io, time, datetime, csv, textwrap
 import numpy as np
 import streamlit as st
@@ -10,7 +10,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from environment.building_env import BuildingStressEnv, ACTION_NAMES
-from risk.risk_module import StructuralRiskScorer, make_pretrained_dsw
+from risk.risk_module import StructuralRiskScorer, load_or_train_dsw
 from agent.ppo_agent import PPOStructuralAgent
 from claude_reasoner.reasoner import GeminiStructuralReasoner
 
@@ -271,7 +271,7 @@ with st.sidebar:
             for k, param_info in params_data.items():
                 label = k.replace("_", " ").title()
                 val   = float(param_info.get("value", 0.0))
-                conf  = float(param_info.get("confidence", 0.0))
+                conf  = float(param_info.get("confidence") or 0.0)
                 src   = str(param_info.get("source_text", "Not found"))
 
                 if conf > 0.8:
@@ -541,10 +541,11 @@ def zone_label(r):
 #  SIMULATION RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 def _run_simulation(params, steps, n_ep, run_id="A"):
-    """Returns (eval_metrics, single_ep, scorer_report, dsw_weight, gemini_result, reward_history)."""
+    """Returns (eval_metrics, single_ep, scorer_report, dsw_weight, reasoner_result, actual_reward_history)."""
     from stable_baselines3 import PPO as _PPO
     from stable_baselines3.common.env_util import make_vec_env as _mve
 
+    dsw = load_or_train_dsw()
     reward_history = []
     prog  = st.progress(0, text="Starting PPO training…")
     chart = st.empty()
@@ -561,7 +562,7 @@ def _run_simulation(params, steps, n_ep, run_id="A"):
         font=dict(color="#94a3b8"),
         title=dict(text="PPO Reward Signal",font=dict(color="#00d4ff",size=12)))
 
-    vec = _mve(lambda: BuildingStressEnv(params, max_steps=20), n_envs=1)
+    vec = _mve(lambda: BuildingStressEnv(params, max_steps=20, dsw_model=dsw), n_envs=1)
     model = _PPO("MlpPolicy", vec, verbose=0, learning_rate=3e-4,
         n_steps=256, batch_size=64, n_epochs=10, gamma=0.95,
         gae_lambda=0.95, clip_range=0.2, ent_coef=0.01,
@@ -573,32 +574,35 @@ def _run_simulation(params, steps, n_ep, run_id="A"):
         model.learn(total_timesteps=learn, reset_num_timesteps=(done==0), progress_bar=False)
         done += learn
         pct = done/total
-        r = float(np.random.normal(-0.5+pct*1.8, 0.3))
-        reward_history.append(r)
+        # Display the actual monitored PPO episode return. Do not synthesize
+        # chart values when a rollout has not completed an episode yet.
+        actual_return = model.logger.name_to_value.get("rollout/ep_rew_mean")
+        if actual_return is not None:
+            reward_history.append(float(actual_return))
         prog.progress(pct, text=f"Training episode {done}/{total}")
-        scen.markdown(f'<div style="color:#64748b;font-size:.8rem;">🔄 {scenario_list[len(reward_history)%5]}</div>',
+        scen.markdown(f'<div style="color:#64748b;font-size:.8rem;">🔄 PPO steps: {done} · DSW guides failure penalties</div>',
             unsafe_allow_html=True)
-        fig.data = []
-        fig.add_trace(go.Scatter(x=list(range(len(reward_history))), y=reward_history,
-            mode="lines", line=dict(color="#00d4ff",width=1.8),
-            fill="tozeroy", fillcolor="rgba(0,212,255,0.08)"))
-        chart.plotly_chart(fig, use_container_width=True, config={"displayModeBar":False}, key=f"ppo_chart_{run_id}_{done}")
+        if reward_history:
+            fig.data = []
+            fig.add_trace(go.Scatter(x=list(range(1, len(reward_history)+1)), y=reward_history,
+                mode="lines+markers", line=dict(color="#00d4ff",width=1.8),
+                fill="tozeroy", fillcolor="rgba(0,212,255,0.08)"))
+            chart.plotly_chart(fig, use_container_width=True, config={"displayModeBar":False}, key=f"ppo_chart_{run_id}_{done}")
 
     prog.progress(1.0, text="Training complete ✓"); scen.empty()
 
     os.makedirs(os.path.join("outputs","models"), exist_ok=True)
     model.save(os.path.join("outputs","models","ppo_structural"))
 
-    agent = PPOStructuralAgent(params)
+    agent = PPOStructuralAgent(params, dsw_model=dsw)
     agent.model = model
     eval_r  = agent.evaluate(n_episodes=int(n_ep))
     single  = agent.run_single_episode()
 
-    env_tmp = BuildingStressEnv(params)
+    env_tmp = BuildingStressEnv(params, dsw_model=dsw)
     obs_tmp, _ = env_tmp.reset()
     scorer  = StructuralRiskScorer()
     report  = scorer.full_report(raw_params=params)
-    dsw     = make_pretrained_dsw()
     dsw_w   = dsw.predict_weight(obs_tmp)
 
     reasoner = GeminiStructuralReasoner()
@@ -833,7 +837,7 @@ if st.session_state.sim_done:
                 st.code(json.dumps(clean_gr, indent=2), language="json")
             raw_resp = gr.get("_meta",{}).get("raw_response","")
             if raw_resp:
-                with st.expander("📝 Raw Gemini Text Output", expanded=False):
+                with st.expander("📝 Raw Groq Text Output", expanded=False):
                     st.markdown(f'<div class="think-box">{raw_resp[:3000]}</div>',
                                 unsafe_allow_html=True)
 
@@ -846,12 +850,14 @@ if st.session_state.sim_done:
         n_viol = len(gr.get("is_code_violations",[]))
 
         abstract = textwrap.dedent(f"""
-        This study presents StructSense AI, an integrated neural RL framework for automated
-        structural failure risk assessment of reinforced concrete buildings using an
+        This study presents StructSense AI, a research prototype for structural risk
+        screening of reinforced concrete buildings using an
         18-dimensional blueprint parameter vector. A PPO agent trained on a custom Gymnasium
-        environment simulated five IS-code stress scenarios. NeuralDSW (safety weight: {dw:.3f})
-        modulates failure penalties dynamically. Google Gemini 2.0 Flash synthesises outputs
-        into a structured verdict. For the assessed building, the system returned
+        environment ran five simplified structural stress checks. NeuralDSW (output: {dw:.3f})
+        is supervised on synthetic risk-threshold labels; its per-state output modulates PPO's
+        failure penalty during training and evaluation, while its training remains separate from PPO.
+        Optional Groq LLaMA reasoning requires a user-supplied API key; otherwise the
+        deterministic rule-based fallback supplies the verdict. For the assessed building, the system returned
         <b>{vt}</b> (failure probability {fp*100:.1f}%, confidence {conf*100:.1f}%).
         Primary failure mode: {pfm}. {n_viol} IS code violation(s) detected.
         """).strip()
@@ -996,5 +1002,5 @@ elif not st.session_state.sim_done:
       <div style="font-size:1.05rem;font-weight:600;color:#94a3b8;margin-bottom:8px;">
         Ready — press RUN SIMULATION above to begin</div>
       <div style="font-size:.8rem;color:#475569;">
-        PPO trains for selected timesteps · 5 IS-code scenarios · Gemini 2.0 Flash verdict
+        PPO trains for selected timesteps · 5 simplified scenarios · optional Groq / rule-based verdict
       </div></div>""", unsafe_allow_html=True)

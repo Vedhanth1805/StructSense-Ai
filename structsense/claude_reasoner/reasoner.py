@@ -307,7 +307,7 @@ class GeminiStructuralReasoner:
             else:
                 flat[key] = str(res)
         for k in ("normal_load", "seismic", "wind_rain", "overload", "degradation"):
-            flat.setdefault(k, "PASS")
+            flat.setdefault(k, "UNKNOWN")
 
         return get_structural_verdict(self._api_key, raw_params, element_risks, flat)
 

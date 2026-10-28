@@ -98,11 +98,13 @@ class BuildingStressEnv(gym.Env):
         blueprint_params: Dict[str, Any],
         max_steps: int = 20,
         render_mode: Optional[str] = None,
+        dsw_model: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.blueprint_params = blueprint_params
         self.max_steps        = max_steps
         self.render_mode      = render_mode
+        self.dsw_model        = dsw_model
 
         # Spaces
         self.observation_space = spaces.Box(
@@ -284,7 +286,8 @@ class BuildingStressEnv(gym.Env):
         """
         Scalar risk weight ∈ [0.5, 2.0].
         Derived from: seismic zone, location_risk_index, age, and maintenance proxy.
-        Analogous to a DSW (Dynamic Structural Weight) output.
+        Deterministic environment risk weight; an optional NeuralDSW prediction
+        is applied separately as a multiplier to the failure penalty.
         """
         zone_w   = self._raw("seismic_zone") / 5.0
         loc_w    = self._raw("location_risk_index")
@@ -548,12 +551,20 @@ class BuildingStressEnv(gym.Env):
         self._action_history.append(action)
 
         rw = self._risk_weight()
+        dsw_weight = (
+            float(self.dsw_model.predict_weight(self._state))
+            if self.dsw_model is not None else None
+        )
+        # Keep the existing deterministic risk heuristic as the baseline. The
+        # learned DSW output scales failure severity around a neutral 0.5:
+        # low predicted risk discounts the penalty, high predicted risk raises it.
+        reward_risk_weight = rw * (0.5 + dsw_weight) if dsw_weight is not None else rw
         if passed:
             reward = 1.0 - recent_penalty
             damage_increment = 0.005   # slight wear per step even on pass
         else:
-            reward = -1.0 * rw - recent_penalty
-            damage_increment = 0.05 * rw   # bigger damage on failure
+            reward = -1.0 * reward_risk_weight - recent_penalty
+            damage_increment = 0.05 * reward_risk_weight   # bigger damage on failure
 
         self._cumulative_damage = min(self._cumulative_damage + damage_increment, 1.0)
 
@@ -589,6 +600,8 @@ class BuildingStressEnv(gym.Env):
             "failure_reason":     failure_reason,
             "risk_score":         round(risk_score, 2),
             "risk_weight":        round(rw, 3),
+            "dsw_safety_weight":  round(dsw_weight, 6) if dsw_weight is not None else None,
+            "reward_risk_weight": round(reward_risk_weight, 6),
             "cumulative_damage":  round(self._cumulative_damage, 3),
             "degradation_factor": round(deg_factor, 3),
             **extra_info,

@@ -1,13 +1,13 @@
 """Quick fallback test — uses a fake API key so API is never called."""
 import sys, os
 sys.path.insert(0, ".")
-os.environ.pop("GEMINI_API_KEY", None)  # clear
-os.environ["GEMINI_API_KEY"] = "fake-key-for-fallback-test"  # invalid = no network call attempted
+os.environ.pop("GROQ_API_KEY", None)  # clear
+os.environ["GROQ_API_KEY"] = "fake-key-for-fallback-test"  # invalid = no network call attempted
 
-# Override _GENAI_OK to False to force fallback without network
+# Override _GROQ_OK to False to force fallback without network
 import claude_reasoner.reasoner as _mod
-_orig = _mod._GENAI_OK
-_mod._GENAI_OK = False
+_orig = _mod._GROQ_OK
+_mod._GROQ_OK = False
 
 from claude_reasoner.reasoner import GeminiStructuralReasoner, ClaudeStructuralReasoner
 
@@ -46,7 +46,7 @@ print(f"scenario_results : {verdict['scenario_results']}")
 print(f"risk_zones       : {verdict['risk_zones']}")
 
 assert verdict["overall_verdict"]         == "HIGH RISK"
-assert verdict["_meta"]["source"]         == "rule_based_fallback"
+assert verdict["_meta"]["source"]         == "rule_based"
 assert len(verdict["is_code_violations"]) >= 4
 assert set(verdict["scenario_results"])   == {"normal_load","seismic","wind_rain","overload","degradation"}
 assert set(verdict["risk_zones"])         == {"foundation","columns","beams","slab"}
@@ -54,5 +54,5 @@ assert set(verdict["risk_zones"])         == {"foundation","columns","beams","sl
 # Alias check
 assert ClaudeStructuralReasoner is GeminiStructuralReasoner
 
-_mod._GENAI_OK = _orig  # restore
+_mod._GROQ_OK = _orig  # restore
 print("\nALL CHECKS PASSED")

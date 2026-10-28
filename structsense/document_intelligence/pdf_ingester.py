@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import fitz  # PyMuPDF
 import pytesseract
@@ -23,6 +23,7 @@ class PDFIngester:
         """
         self.tesseract_lang = tesseract_lang
         self.ocr_psm = ocr_psm
+        self.last_ocr_status = "not_attempted"
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -31,6 +32,7 @@ class PDFIngester:
         """
         Run Tesseract OCR on a single PDF page.
         """
+        self.last_ocr_status = "running"
         try:
             pix = page.get_pixmap(dpi=dpi)
             mode = "RGB" if pix.n < 4 else "CMYK"
@@ -39,29 +41,51 @@ class PDFIngester:
             text = pytesseract.image_to_string(
                 image, lang=self.tesseract_lang, config=config
             )
+            self.last_ocr_status = "succeeded" if text.strip() else "no_text"
             return text.strip()
+        except pytesseract.pytesseract.TesseractNotFoundError as e:
+            self.last_ocr_status = "unavailable"
+            logger.warning("Tesseract OCR is unavailable for page %s: %s", page.number + 1, e)
+            return ""
         except Exception as e:
+            self.last_ocr_status = "failed"
             logger.warning(f"OCR failed for page {page.number + 1}: {e}")
             return ""
 
-    def _extract_page_text(self, page: fitz.Page) -> (str, str):
+    def _extract_page_tables(self, page: fitz.Page) -> List[List[List[str]]]:
+        """Extract visible table cells when supported by the installed PyMuPDF."""
+        try:
+            finder = page.find_tables()
+            return [table.extract() for table in finder.tables]
+        except (AttributeError, Exception) as exc:
+            logger.debug("Table extraction unavailable on page %s: %s", page.number + 1, exc)
+            return []
+
+    def _extract_page_text(self, page: fitz.Page) -> Tuple[str, str, List[List[List[str]]]]:
         """
         Try to extract text via PyMuPDF first. If the extracted text is short
         (< 50 characters) we consider it a scanned page and fallback to OCR.
         Returns (text, method) where method is 'pymupdf' or 'tesseract'.
         """
         text = page.get_text().strip()
-        if len(text) >= 50:
-            return text, "pymupdf"
+        tables = self._extract_page_tables(page)
+        table_text = "\n".join(" | ".join(str(cell or "") for cell in row) for table in tables for row in table)
+        if table_text:
+            text = "\n".join(part for part in (text, table_text) if part)
+        if len(text) >= 50 or tables:
+            return text, "pymupdf", tables
         # Fallback to OCR
+        self.last_ocr_status = "not_attempted"
         ocr_text = self._ocr_page(page)
-        method = "tesseract"
-        if not ocr_text:
-            # If OCR also returns nothing, keep the short text (could be image only)
-            text = text
-        else:
+        if ocr_text:
             text = ocr_text
-        return text, method
+            return text, "tesseract", tables
+        # Keep any machine-readable text if OCR is unavailable or fails.
+        if text:
+            return text, "pymupdf", tables
+        if self.last_ocr_status == "unavailable":
+            return text, "tesseract_unavailable", tables
+        return text, "tesseract_failed", tables
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,14 +119,17 @@ class PDFIngester:
 
             for i in range(total_pages):
                 page = doc[i]
-                text, method = self._extract_page_text(page)
+                text, method, tables = self._extract_page_text(page)
                 char_count = len(text)
                 page_dict = {
                     "page_num": i + 1,
                     "text": text,
+                    "tables": tables,
                     "method": method,
                     "char_count": char_count,
                 }
+                if method.startswith("tesseract_"):
+                    page_dict["ocr_status"] = "unavailable" if method == "tesseract_unavailable" else "failed"
                 pages_info.append(page_dict)
                 full_text_parts.append(text)
                 if method != "pymupdf":
@@ -112,7 +139,12 @@ class PDFIngester:
 
             full_text = "\n".join(full_text_parts)
 
-            if all_pymupdf:
+            methods = [page["method"] for page in pages_info]
+            if methods and all(method == "tesseract_unavailable" for method in methods):
+                quality = "ocr_unavailable"
+            elif methods and all(method == "tesseract_failed" for method in methods):
+                quality = "ocr_failed"
+            elif all_pymupdf:
                 quality = "high"
             elif all_tesseract:
                 quality = "ocr_only"

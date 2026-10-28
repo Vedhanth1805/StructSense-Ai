@@ -182,17 +182,21 @@ def _chart_reward(reward_history: List[float], tmpdir: str) -> str:
     fig.patch.set_facecolor("#0a0e1a")
     ax.set_facecolor("#0d1224")
     x = list(range(len(reward_history)))
-    ax.plot(x, reward_history, color="#00d4ff", lw=1.6, zorder=3)
-    ax.fill_between(x, reward_history, alpha=0.15, color="#00d4ff")
-    # rolling mean
-    if len(reward_history) >= 5:
-        rm = np.convolve(reward_history, np.ones(5)/5, "valid")
-        ax.plot(range(4, len(reward_history)), rm, color="#ff9f40",
-                lw=2.2, linestyle="--", label="5-step avg", zorder=4)
+    if reward_history:
+        ax.plot(x, reward_history, color="#00d4ff", lw=1.6, zorder=3)
+        ax.fill_between(x, reward_history, alpha=0.15, color="#00d4ff")
+        # rolling mean
+        if len(reward_history) >= 5:
+            rm = np.convolve(reward_history, np.ones(5)/5, "valid")
+            ax.plot(range(4, len(reward_history)), rm, color="#ff9f40",
+                    lw=2.2, linestyle="--", label="5-step avg", zorder=4)
+    else:
+        ax.text(.5, .5, "PPO reward history unavailable", transform=ax.transAxes,
+                ha="center", va="center", color="#94a3b8", fontsize=10)
     ax.axhline(0, color="#1e2a45", lw=0.8)
     ax.set_xlabel("Training Step",  color="#94a3b8", fontsize=8)
     ax.set_ylabel("Episode Reward", color="#94a3b8", fontsize=8)
-    ax.set_title("PPO Reward Convergence", color="#00d4ff", fontsize=9, pad=6)
+    ax.set_title("PPO Reward History", color="#00d4ff", fontsize=9, pad=6)
     ax.tick_params(colors="#64748b", labelsize=7)
     for spine in ax.spines.values(): spine.set_edgecolor("#1e2a45")
     ax.legend(fontsize=7, facecolor="#0d1224", edgecolor="#1e2a45",
@@ -344,15 +348,15 @@ def _flowables_title_page(verdict: dict, state_params: dict) -> list:
         f"framework for automated structural failure risk assessment of reinforced concrete "
         f"buildings. The system ingests an 18-dimensional blueprint parameter vector "
         f"(material properties, geometry, and site conditions) into a custom Gymnasium "
-        f"environment and deploys a Proximal Policy Optimisation (PPO) agent to simulate "
-        f"five IS-code-compliant stress scenarios (IS 456:2000, IS 1893:2016, IS 875). "
-        f"A NeuralDSW module — a 3-layer MLP trained with an adaptive reward signal — "
-        f"computes a structural safety weight that modulates failure penalties during "
-        f"training. Risk scoring employs a weighted multi-factor model across six critical "
-        f"parameters, producing per-element risk zones for foundation, columns, beams, and "
-        f"slab. Groq LLaMA 3.3 70B is invoked as a reasoning layer to synthesise "
-        f"simulation outputs into a research-grade structured verdict with IS code violation "
-        f"analysis. "
+        f"environment and deploys a Proximal Policy Optimisation (PPO) agent to exercise "
+        f"five simplified structural stress checks. A NeuralDSW module — a 3-layer MLP "
+        f"supervised on bundled synthetic risk data — computes a supplementary safety "
+        f"weight; it is not calibrated against field outcomes. The aggregate risk is "
+        f"0.50 times the original six-factor weighted score plus 0.50 times the arithmetic "
+        f"mean of foundation, column, beam, and slab risks. Per-element scores and "
+        f"scenario check outcomes remain separately visible. These prototype checks are "
+        f"not code-compliance certification or formal design verification. Groq LLaMA "
+        f"3.3 70B is optional; without credentials the rule-based explanation fallback is used. "
         f"For the analysed {floors}-storey M{grade} RC building (Seismic Zone {zone}, "
         f"age {age} years), the system returned a verdict of <b>{vtext}</b> "
         f"with failure probability {fp*100:.1f}% (confidence {conf*100:.1f}%). "
@@ -414,26 +418,29 @@ def _flowables_methodology(state_params: dict) -> list:
     items += [
         _sec("1.2", "RL Simulation Framework", "sec2"),
         _p("A Proximal Policy Optimisation (PPO) agent (Schulman et al., 2017) is trained "
-           "on the custom <i>BuildingStressEnv</i> Gymnasium environment. The agent learns "
-           "to select stress scenarios that maximally reveal structural vulnerabilities. "
-           "The reward function is:", "body"),
+           "on the custom <i>BuildingStressEnv</i> Gymnasium environment. Its discrete "
+           "actions select one of five simplified stress checks. Environment rewards use "
+           "a deterministic risk-weight heuristic and a repeated-action penalty; the "
+           "NeuralDSW model is not connected to PPO rollouts. On pass, the base reward is +1; "
+           "on failure, the base reward is the negative environment risk weight:", "body"),
         _sp(4),
-        _p("<i>R = +1.0 (scenario passed) | R = −1.0 × w_safety (scenario failed)</i>",
+        _p("<i>R = +1.0 (scenario passed) | R = −1.0 × w_env (scenario failed)</i>",
            "body_bold"),
         _sp(4),
-        _p("where <i>w_safety</i> ∈ [0,1] is the NeuralDSW safety weight. PPO "
+        _p("where <i>w_env</i> is the deterministic environment risk weight. PPO "
            "hyperparameters: learning rate 3×10⁻⁴, n_steps=256, batch_size=64, "
            "n_epochs=10, γ=0.95, λ=0.95, clip_range=0.2, ent_coef=0.01.", "body"),
         _sp(8),
 
         _sec("1.3", "NeuralDSW Safety-Weight Module", "sec2"),
         _p("NeuralDSW is a 3-layer MLP (18 → 64 → 32 → 1) with ReLU activations and "
-           "0.2 dropout, outputting a Sigmoid-clamped safety weight. It is trained on "
-           "synthetic structural data with a composite structural efficiency target. "
-           "The adaptive reward formula is: "
-           "<i>R_adaptive = efficiency − (w_safety × failure_penalty)</i>. "
-           "Higher safety weights impose heavier penalties for simulated failures, "
-           "guiding the PPO agent towards riskier but more informative scenario selection.",
+           "dropout. The current factory creates synthetic normalized states and labels "
+           "each one 1 when StructuralRiskScorer.score() ≥ 0.55, otherwise 0; "
+           "NeuralDSW.fit() uses Adam and binary cross-entropy. This supervised training "
+           "is independent of PPO and differs from joint RL training with cumulative "
+           "episode-reward gradients. Describe its output as a learned approximation of "
+           "the risk-scoring formula's threshold classification, not an RL-derived "
+           "contextual safety signal. The adaptive_reward() helper is not used by PPO.",
            "body"),
         _sp(8),
 
@@ -501,8 +508,9 @@ def _flowables_results(verdict: dict, state_params: dict,
 
     items += [
         _sec("2.2", "Element Risk Scores", "sec2"),
-        _p("Table 3 presents the risk score per structural element, derived from "
-           "the weighted multi-factor StructuralRiskScorer model.", "body"),
+        _p("Table 3 presents each element score. The displayed aggregate separately blends "
+           "the original six-factor weighted score and the equal-weight mean of these four "
+           "element scores (50% each); this screening formula is not calibrated for design approval.", "body"),
         _sp(6),
     ]
 
@@ -545,12 +553,12 @@ def _flowables_results(verdict: dict, state_params: dict,
     # Charts
     items += [
         _sec("2.3", "Training Convergence and Risk Visualisation", "sec2"),
-        _p("Figure 1 shows the PPO reward convergence over training steps. "
+        _p("Figure 1 shows the PPO reward history when available. "
            "Figure 2 shows the element risk breakdown.", "body"),
         _sp(8),
         Image(chart_reward, width=14*cm, height=5.8*cm),
         _sp(2),
-        _p("<i>Figure 1: PPO reward signal convergence during RL training.</i>", "small"),
+        _p("<i>Figure 1: PPO reward history; blank history is reported as unavailable.</i>", "small"),
         _sp(10),
         Image(chart_bars, width=14*cm, height=5.0*cm),
         _sp(2),
@@ -727,7 +735,7 @@ def generate_report(
 
     # ── Generate charts ──────────────────────────────────────────────────
     tmpdir = tempfile.mkdtemp(prefix="structsense_")
-    rh     = reward_history if reward_history else list(np.random.normal(0, 0.5, 30))
+    rh     = reward_history or []
     c_reward  = _chart_reward(rh, tmpdir)
     c_bars    = _chart_risk_bars(risk_scores, tmpdir)
     c_heatmap = _chart_heatmap(verdict.get("scenario_results", {}), tmpdir)
